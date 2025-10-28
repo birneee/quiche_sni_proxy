@@ -7,7 +7,7 @@ use boring::x509::X509;
 use log::info;
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 
-pub(crate) fn load_or_generate_keys(cert_path: &Option<PathBuf>, key_path: &Option<PathBuf>) -> (X509, PKey<Private>) {
+pub fn load_or_generate_keys(cert_path: &Option<PathBuf>, key_path: &Option<PathBuf>) -> (X509, PKey<Private>) {
     match (&cert_path, &key_path) {
         (Some(cert_path), Some(key_path)) => {
             let cert = fs::read(cert_path).unwrap();

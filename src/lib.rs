@@ -15,9 +15,7 @@ use std::fmt::{Display, Formatter};
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::path::PathBuf;
 use std::str::from_utf8;
-use crate::cert::load_or_generate_keys;
-
-const ALPN_HTTP_3: &[u8] = b"h3";
+pub use crate::cert::load_or_generate_keys;
 
 type Runner = runner::Runner<ConnAppData, AppData, ()>;
 
@@ -44,6 +42,8 @@ pub struct Args {
     /// The server port to forwards packets to
     #[arg(long, value_name = "PORT", default_value = "443")]
     pub forward_port: u16,
+    #[arg(long, default_value = "h3")]
+    pub alpn: String,
 }
 
 pub fn run_proxy(args: Args, close_pipe_rx: Option<&mut Receiver>) {
@@ -62,7 +62,7 @@ pub fn run_proxy(args: Args, close_pipe_rx: Option<&mut Receiver>) {
             b.set_certificate(&cert).unwrap();
             b
         }).unwrap();
-        c.set_application_protos(&[ALPN_HTTP_3]).unwrap();
+        c.set_application_protos(&[args.alpn.as_bytes()]).unwrap();
         c.set_max_idle_timeout(30000);
         c.set_initial_max_streams_bidi(100);
         c.set_initial_max_streams_uni(100);
@@ -72,6 +72,26 @@ pub fn run_proxy(args: Args, close_pipe_rx: Option<&mut Receiver>) {
         c.set_initial_max_stream_data_uni(1000000);
         c.set_max_connection_window(25165824);
         c.set_max_stream_window(16777216);
+        c
+    };
+
+    let server_facing_config = {
+        let mut c = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        c.verify_peer(!args.no_verify);
+        c.set_application_protos(&[args.alpn.as_bytes()]).unwrap();
+        c.set_max_idle_timeout(30000);
+        c.set_initial_max_streams_bidi(100);
+        c.set_initial_max_streams_uni(100);
+        c.set_initial_max_data(10000000);
+        c.set_initial_max_stream_data_bidi_remote(1000000);
+        c.set_initial_max_stream_data_bidi_local(1000000);
+        c.set_initial_max_stream_data_uni(1000000);
+        c.set_active_connection_id_limit(2);
+        c.set_initial_congestion_window_packets(10);
+        c.set_max_connection_window(25165824);
+        c.set_max_stream_window(16777216);
+        c.enable_pacing(true);
+        c.grease(false);
         c
     };
 
@@ -86,6 +106,7 @@ pub fn run_proxy(args: Args, close_pipe_rx: Option<&mut Receiver>) {
             proxy_conns: Default::default(),
             args,
             buf: [0u8; 1 << 16],
+            server_facing_config: Some(server_facing_config),
         },
     );
 
@@ -114,9 +135,6 @@ fn post_handle_recvs(runner: &mut Runner) {
         if !conn.conn.is_established() && !conn.conn.is_in_early_data() {
             continue; // not ready for h3 yet
         }
-        if ALPN_HTTP_3 != conn.conn.application_proto() {
-            continue; // not h3
-        }
         if conn.conn.is_draining() | conn.conn.is_closed() {
             continue;
         }
@@ -140,14 +158,14 @@ fn post_handle_recvs(runner: &mut Runner) {
     }
 
     while let Some(proxy_conn) = setup_queue.pop_front() {
+        let mut server_facing_config = endpoint.app_data_mut().server_facing_config.take().unwrap();
         let client_side_conn_id = proxy_conn.client_side_conn_id;
         let client_side_conn = endpoint.conn(client_side_conn_id).unwrap();
         let client_side_addr = client_side_conn.conn.path_stats().next().unwrap().peer_addr;
         let client_side_trace_id = client_side_conn.conn.trace_id().to_string();
 
         let args = &endpoint.app_data().args;
-        let mut server_side_conf =
-            create_server_side_config(client_side_conn, args);
+        create_server_side_config(client_side_conn, &mut server_facing_config);
 
         info!("resolve IP of {}", &proxy_conn.server_name);
         let server_side_addr: SocketAddrV4 = (proxy_conn.server_name.as_ref(), args.forward_port)
@@ -164,13 +182,14 @@ fn post_handle_recvs(runner: &mut Runner) {
             Some(proxy_conn.server_name.as_ref()),
             runner.sockets.sockets.get(0).unwrap().local_addr,
             server_side_addr.into(),
-            &mut server_side_conf,
+            &mut server_facing_config,
             ConnAppData {
                 proxy_conn_id: None,
             },
             None,
             None,
         );
+        endpoint.app_data_mut().server_facing_config.replace(server_facing_config); // put back
 
         let proxy_conn = proxy_conn.with_server(server_side_conn_id);
         let proxy_conn_id = endpoint.app_data_mut().proxy_conns.insert(proxy_conn);
@@ -224,35 +243,16 @@ fn post_handle_recvs(runner: &mut Runner) {
 }
 
 /// applies similar config from the client-side connection to the server-side connection
-fn create_server_side_config(client_side_conn: &Conn<ConnAppData>, args: &Args) -> quiche::Config {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-    config.verify_peer(!args.no_verify);
-    config.set_application_protos(&[ALPN_HTTP_3]).unwrap();
-    config.set_max_idle_timeout(30000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_initial_max_streams_uni(100);
-    config.set_initial_max_data(10000000);
-    config.set_initial_max_stream_data_bidi_remote(1000000);
-    config.set_initial_max_stream_data_bidi_local(1000000);
-    config.set_initial_max_stream_data_uni(1000000);
-    config.set_active_connection_id_limit(2);
-    config.set_initial_congestion_window_packets(10);
-    config.set_max_connection_window(25165824);
-    config.set_max_stream_window(16777216);
-    config.enable_pacing(true);
-    config.grease(false);
+fn create_server_side_config(client_side_conn: &Conn<ConnAppData>, c: &mut quiche::Config) {
     // for h3, datagram frame support must be mirrored because it is also part of the h3 settings
-    config.enable_dgram(
+    c.enable_dgram(
         client_side_conn
             .conn
-            .peer_transport_params()
-            .unwrap()
-            .max_datagram_frame_size
+            .dgram_max_writable_len()
             .is_some(),
         10,
         10,
     );
-    config
 }
 
 /// return true if closed
@@ -264,7 +264,12 @@ fn forward_error_and_timeout(rx_conn: &mut Conn<ConnAppData>, tx_conn: &mut Conn
             reason: b"timed out".to_vec(),
         }
     } else if let Some(err) = rx_conn.conn.peer_error() {
-        err
+        if !err.is_app && (0x0100..=0x01ff).contains(&err.error_code) { // is CRYPTO_ERROR
+            //todo convert, because those can only be sent during the handshake, but i have not found an error that stops chromium from retrying, similar to crypto_error 0x0128
+            err
+        } else {
+            err
+        }
     } else if let Some(_) = rx_conn.conn.local_error() {
         &ConnectionError {
             is_app: false,
@@ -310,17 +315,17 @@ fn forward_stream(rx_conn: &mut quiche::Connection, tx_conn: &mut quiche::Connec
         Ok(_) => {}
         Err(quiche::Error::Done) => {}
         Err(quiche::Error::StreamStopped(err_code)) => {
-            rx_conn.stream_shutdown(stream_id,Shutdown::Read, err_code).unwrap();
+            rx_conn.stream_shutdown(stream_id, Shutdown::Read, err_code).unwrap();
             info!("proxy conn {} stream {} forward STOP_SENDING ({})", proxy_conn_id, stream_id, err_code);
             return;
-        },
+        }
         Err(quiche::Error::StreamLimit) => return, // not ready yet
         Err(e) => panic!("{}", e),
     }
     let start_cap = match tx_conn.stream_capacity(stream_id) {
         Ok(v) => v,
         Err(quiche::Error::InvalidStreamState(_)) => return, // sometimes streams are still readable after fin
-        Err(e)=> panic!("unexpected error: {}", e),
+        Err(e) => panic!("unexpected error: {}", e),
     };
     let mut total_written = 0;
     let mut fin = false;
@@ -373,6 +378,8 @@ struct AppData {
     proxy_conns: Slab<ProxyConn>,
     args: Args,
     buf: [u8; 1 << 16],
+    /// it is only optional to temporary take it
+    server_facing_config: Option<quiche::Config>,
 }
 
 struct HalfOpenProxyConn {
@@ -417,11 +424,17 @@ impl Default for ConnAppData {
 
 /// helper for formating outputs
 /// example: `println!("{}", fmt(|f| f.debug_struct("Test").finish()))`
-fn fmt<F>(f: F) -> impl Display where F: Fn(&mut Formatter<'_>) -> std::fmt::Result {
+fn fmt<F>(f: F) -> impl Display
+where
+    F: Fn(&mut Formatter<'_>) -> std::fmt::Result,
+{
     struct A<F> {
         f: F,
     }
-    impl<F> Display for A<F> where F: Fn(&mut Formatter<'_>) -> std::fmt::Result {
+    impl<F> Display for A<F>
+    where
+        F: Fn(&mut Formatter<'_>) -> std::fmt::Result,
+    {
         fn fmt(&self, fmt: &mut Formatter<'_>) -> std::fmt::Result {
             (self.f)(fmt)
         }

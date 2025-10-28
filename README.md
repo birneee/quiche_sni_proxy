@@ -33,8 +33,8 @@ RUST_LOG=info ../../target/release/proxy --cert ../../cert.pem --key ../../key.p
 ## Open in browser
 
 ```bash
-SSLKEYLOGFILE=../../sslkeylog chromium 'https://example.com' \
-  --user-data-dir=../../chromium-data \
+SSLKEYLOGFILE=sslkeylog chromium 'https://example.com' \
+  --user-data-dir=chromium-data \
   --origin-to-force-quic-on="*" \
   --ignore-certificate-errors-spki-list="<spki>" \
   --host-resolver-rules="MAP * 127.0.0.1:4433"
