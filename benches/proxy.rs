@@ -52,6 +52,7 @@ fn bench_transmit(b: &mut Bencher, num_bytes: usize, gso: bool, gro: bool, proxy
 const PROTO: &[u8] = b"proto1";
 const COPY_BUF_SIZE: usize = 1 << 16;
 const MAX_DATA: u64 = 1_000_000;
+const IDLE_TIMEOUT: u64 = 100;
 
 struct ClientAppData {
     sent_req: bool,
@@ -134,6 +135,7 @@ fn run_client(num_bytes: usize, gso: bool, gro: bool, proxy: bool) -> Duration {
                     c.set_application_protos(&[PROTO]).unwrap();
                     c.set_initial_max_data(MAX_DATA);
                     c.set_initial_max_stream_data_bidi_local(MAX_DATA);
+                    c.set_max_idle_timeout(IDLE_TIMEOUT);
                     c
                 },
                 (),
@@ -221,6 +223,7 @@ fn run_server(close_pipe_rx: &mut Receiver, gso: bool, gro: bool) {
                         c.set_initial_max_streams_bidi(5);
                         c.set_initial_max_data(MAX_DATA);
                         c.set_initial_max_stream_data_bidi_remote(MAX_DATA);
+                        c.set_max_idle_timeout(IDLE_TIMEOUT);
                         c
                     };
                     c
