@@ -39,3 +39,8 @@ SSLKEYLOGFILE=sslkeylog chromium 'https://example.com' \
   --ignore-certificate-errors-spki-list="<spki>" \
   --host-resolver-rules="MAP * 127.0.0.1:4433"
 ```
+
+## Run benchmarks
+
+- Statistics: `cargo bench --bench transmit`
+- Flamegraph: `cargo bench --bench transmit -- --profile-time 10`

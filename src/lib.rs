@@ -46,6 +46,7 @@ pub struct Args {
     pub alpn: String,
 }
 
+#[allow(clippy::field_reassign_with_default)]
 pub fn run_proxy(args: Args, close_pipe_rx: Option<&mut Receiver>) {
     let (cert, key) = load_or_generate_keys(&args.cert, &args.key);
 
@@ -63,15 +64,15 @@ pub fn run_proxy(args: Args, close_pipe_rx: Option<&mut Receiver>) {
             b
         }).unwrap();
         c.set_application_protos(&[args.alpn.as_bytes()]).unwrap();
-        c.set_max_idle_timeout(30000);
+        c.set_max_idle_timeout(30_000);
         c.set_initial_max_streams_bidi(100);
         c.set_initial_max_streams_uni(100);
-        c.set_initial_max_data(10000000);
-        c.set_initial_max_stream_data_bidi_remote(1000000);
-        c.set_initial_max_stream_data_bidi_local(1000000);
-        c.set_initial_max_stream_data_uni(1000000);
-        c.set_max_connection_window(25165824);
-        c.set_max_stream_window(16777216);
+        c.set_initial_max_data(10_000_000);
+        c.set_initial_max_stream_data_bidi_remote(1_000_000);
+        c.set_initial_max_stream_data_bidi_local(1_000_000);
+        c.set_initial_max_stream_data_uni(1_000_000);
+        c.set_max_connection_window(25_165_824);
+        c.set_max_stream_window(16_777_216);
         c
     };
 
@@ -79,17 +80,17 @@ pub fn run_proxy(args: Args, close_pipe_rx: Option<&mut Receiver>) {
         let mut c = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         c.verify_peer(!args.no_verify);
         c.set_application_protos(&[args.alpn.as_bytes()]).unwrap();
-        c.set_max_idle_timeout(30000);
+        c.set_max_idle_timeout(30_000);
         c.set_initial_max_streams_bidi(100);
         c.set_initial_max_streams_uni(100);
-        c.set_initial_max_data(10000000);
-        c.set_initial_max_stream_data_bidi_remote(1000000);
-        c.set_initial_max_stream_data_bidi_local(1000000);
-        c.set_initial_max_stream_data_uni(1000000);
+        c.set_initial_max_data(10_000_000);
+        c.set_initial_max_stream_data_bidi_remote(1_000_000);
+        c.set_initial_max_stream_data_bidi_local(1_000_000);
+        c.set_initial_max_stream_data_uni(1_000_000);
         c.set_active_connection_id_limit(2);
         c.set_initial_congestion_window_packets(10);
-        c.set_max_connection_window(25165824);
-        c.set_max_stream_window(16777216);
+        c.set_max_connection_window(25_165_824);
+        c.set_max_stream_window(16_777_216);
         c.enable_pacing(true);
         c.grease(false);
         c
@@ -270,7 +271,7 @@ fn forward_error_and_timeout(rx_conn: &mut Conn<ConnAppData>, tx_conn: &mut Conn
         } else {
             err
         }
-    } else if let Some(_) = rx_conn.conn.local_error() {
+    } else if rx_conn.conn.local_error().is_some() {
         &ConnectionError {
             is_app: false,
             error_code: 0,
@@ -351,7 +352,8 @@ fn forward_stream(rx_conn: &mut quiche::Connection, tx_conn: &mut quiche::Connec
         }
         let buf = &mut buf[..received];
 
-        let written = tx_conn.stream_send(stream_id, &buf, fin).unwrap();
+        let written = tx_conn.stream_send(stream_id, buf, fin).unwrap();
+        assert_eq!(written, buf.len());
         total_written += written;
         if fin {
             break;
@@ -409,17 +411,9 @@ struct ProxyConn {
     closed: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ConnAppData {
     proxy_conn_id: Option<usize>,
-}
-
-impl Default for ConnAppData {
-    fn default() -> Self {
-        Self {
-            proxy_conn_id: None,
-        }
-    }
 }
 
 /// helper for formating outputs

@@ -2,17 +2,19 @@ use boring::ssl::{SslContextBuilder, SslMethod};
 use criterion::{criterion_group, criterion_main, Bencher, Criterion, Throughput};
 use quiche_mio_runner::mio::unix::pipe::Receiver;
 use quiche_mio_runner::quiche_endpoint::quiche::PROTOCOL_VERSION;
-use quiche_mio_runner::quiche_endpoint::{quiche, Endpoint, EndpointConfig, ServerConfig};
+use quiche_mio_runner::quiche_endpoint::{Conn, Endpoint, EndpointConfig, ServerConfig, quiche};
 use quiche_mio_runner::{mio, Config, Runner, Socket};
 use quiche_sni_proxy::{load_or_generate_keys, run_proxy};
 use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
+use pprof::criterion::{Output, PProfProfiler};
 
 criterion_group!(
     name = benches;
     config = Criterion::default()
         .sample_size(10)
+        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
         .measurement_time(Duration::from_secs(10));
     targets = targets
 );
@@ -23,7 +25,7 @@ fn targets(c: &mut Criterion) {
     {
         let mut g = c.benchmark_group("request");
         let num_bytes = 1E9 as usize;
-        g.throughput(Throughput::Bits(num_bytes as u64 * 8));
+        g.throughput(Throughput::Bytes(num_bytes as u64));
         g.bench_function("1G", |b| bench_transmit(b, num_bytes, false, false, false));
         g.bench_function("1G-gso-gro", |b| bench_transmit(b, num_bytes, true, true, false));
         g.bench_function("1G-proxy", |b| bench_transmit(b, num_bytes, false, false, true));
@@ -51,8 +53,8 @@ fn bench_transmit(b: &mut Bencher, num_bytes: usize, gso: bool, gro: bool, proxy
 
 const PROTO: &[u8] = b"proto1";
 const COPY_BUF_SIZE: usize = 1 << 16;
-const MAX_DATA: u64 = 1_000_000;
-const IDLE_TIMEOUT: u64 = 100;
+const MAX_DATA: u64 = 10_000_000;
+const IDLE_TIMEOUT: u64 = 1000;
 
 struct ClientAppData {
     sent_req: bool,
@@ -76,6 +78,18 @@ impl ClientAppData {
     }
 }
 
+
+fn on_close<T1, T2>(c: &Conn<T1>, _: &mut T2) {
+    let perspective = if c.conn.is_server() {
+        "server"
+    } else {
+        "client"
+    };
+    assert!(!c.conn.is_timed_out(), "{perspective}");
+    assert!(!c.conn.local_error().is_none(), "{perspective} {:?}", c.conn.local_error().unwrap());
+    assert!(!c.conn.peer_error().is_none(), "{perspective} {:?}", c.conn.peer_error().unwrap());
+}
+
 fn run_client(num_bytes: usize, gso: bool, gro: bool, proxy: bool) -> Duration {
     let socket = Socket::bind("0.0.0.0:0".parse().unwrap(), !gro, false, !gso).unwrap();
     let local_addr = socket.local_addr;
@@ -87,6 +101,7 @@ fn run_client(num_bytes: usize, gso: bool, gro: bool, proxy: bool) -> Duration {
     let mut r = Runner::new(
         {
             let mut c = Config::<(), ClientAppData, ()>::default();
+            c.on_close = Some(on_close);
             c.post_handle_recvs = |r| {
                 let (conn, app_data) = r.endpoint.conn_with_app_data_mut(0);
                 let conn = &mut conn.unwrap().conn;
@@ -95,7 +110,8 @@ fn run_client(num_bytes: usize, gso: bool, gro: bool, proxy: bool) -> Duration {
                     return;
                 }
                 if !app_data.sent_req {
-                    conn.stream_send(0, &buf[..0], true).unwrap();
+                    let n = conn.stream_send(0, &buf[..1], true).unwrap();
+                    assert_eq!(n, 1);
                     app_data.sent_req = true;
                     app_data.req_instant = Some(Instant::now());
                 }
@@ -120,7 +136,7 @@ fn run_client(num_bytes: usize, gso: bool, gro: bool, proxy: bool) -> Duration {
             let mut e = Endpoint::new(
                 None,
                 {
-                    let c = EndpointConfig::<(), ClientAppData>::default();
+                    let c = EndpointConfig::default();
                     c
                 },
                 ClientAppData::new(num_bytes),
@@ -173,6 +189,7 @@ fn run_server(close_pipe_rx: &mut Receiver, gso: bool, gro: bool) {
     let mut r = Runner::new(
         {
             let mut c = Config::<ServerAppData, (), ()>::default();
+            c.on_close = Some(on_close);
             c.post_handle_recvs = |r| {
                 let Some(conn) = r.endpoint.conn_mut(0) else { return; };
                 let (conn, app_data) = (&mut conn.conn, &mut conn.app_data);
@@ -181,7 +198,7 @@ fn run_server(close_pipe_rx: &mut Receiver, gso: bool, gro: bool) {
                     return;
                 }
                 if !app_data.received_req {
-                    let (_len, fin) = match conn.stream_recv(0, buf) {
+                    let (len, fin) = match conn.stream_recv(0, buf) {
                         Ok(v) => v,
                         Err(quiche::Error::Done) => {
                             println!("server no req");
@@ -189,6 +206,8 @@ fn run_server(close_pipe_rx: &mut Receiver, gso: bool, gro: bool) {
                         },
                         Err(e) => panic!("{:?}", e)
                     };
+                    assert_eq!(len, 1);
+                    assert!(fin);
                     if !fin {
                         return;
                     }
